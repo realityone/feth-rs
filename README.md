@@ -1,6 +1,6 @@
 # feth-rs
 
-A Rust library for creating and managing macOS [fake ethernet (feth)](https://developer.apple.com/documentation/kernel/iokit/network) interface pairs, providing TAP-like virtual network devices.
+A Rust library for creating and managing macOS fake ethernet (feth) interface pairs, providing TAP-like virtual network devices.
 
 feth interfaces are virtual ethernet interfaces available on macOS that can be paired together. Traffic sent on one side of the pair is received on the other, making them useful for building VPNs, network tunnels, packet capture tools, and testing network stacks without real hardware.
 
@@ -19,9 +19,9 @@ A feth pair consists of two interfaces linked as peers:
 ```
 ┌─────────────────────┐         ┌─────────────────────┐
 │  feth0 (virtual)    │  peer   │  feth1 (I/O side)   │
-│                     │◄───────►│                      │
-│  IP: 10.0.0.1/24    │         │  BPF + AF_NDRV       │
-│  Managed by kernel  │         │  Raw frame access    │
+│                     │◄───────►│                     │
+│  IP: 10.0.0.1/24    │         │  BPF + AF_NDRV      │
+│  Managed by kernel  │         │  Raw frame access   │
 └─────────────────────┘         └─────────────────────┘
 ```
 
