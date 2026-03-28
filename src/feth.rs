@@ -1,8 +1,4 @@
-use std::fmt;
-use std::io;
-use std::mem;
-use std::net::Ipv4Addr;
-use std::str::FromStr;
+use std::{fmt, io, mem, net::Ipv4Addr, str::FromStr};
 
 use crate::xnu;
 
@@ -515,11 +511,11 @@ mod tests {
 
     #[test]
     fn test_prefix_to_mask() {
-        assert_eq!(prefix_to_mask(0), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(prefix_to_mask(0), Ipv4Addr::UNSPECIFIED);
         assert_eq!(prefix_to_mask(8), Ipv4Addr::new(255, 0, 0, 0));
         assert_eq!(prefix_to_mask(16), Ipv4Addr::new(255, 255, 0, 0));
         assert_eq!(prefix_to_mask(24), Ipv4Addr::new(255, 255, 255, 0));
-        assert_eq!(prefix_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(prefix_to_mask(32), Ipv4Addr::BROADCAST);
         assert_eq!(prefix_to_mask(25), Ipv4Addr::new(255, 255, 255, 128));
     }
 

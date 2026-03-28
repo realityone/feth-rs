@@ -4,8 +4,7 @@
 //!
 //!     sudo cargo run --example fethctl -- <command>
 
-use std::net::Ipv4Addr;
-use std::process::ExitCode;
+use std::{net::Ipv4Addr, process::ExitCode};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use feth_rs::feth::{Feth, FethStatus};
@@ -107,7 +106,7 @@ fn print_status(s: &FethStatus) {
 
     // inet line
     if let Some(addr) = s.inet {
-        let prefix = s.netmask.map(netmask_to_prefix).unwrap_or(0);
+        let prefix = s.netmask.map_or(0, netmask_to_prefix);
         let netmask_hex = s
             .netmask
             .map(|m| format!("0x{:08x}", u32::from(m)))

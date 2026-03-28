@@ -3,16 +3,13 @@
 //! Contains FFI struct definitions, ioctl wrappers, and low-level helpers
 //! for interacting with macOS/XNU network interfaces via `ioctl()`.
 //!
-//! Type names follow the XNU source naming convention (snake_case matching
+//! Type names follow the XNU source naming convention (`snake_case` matching
 //! the C identifiers in `bsd/net/if.h`, `bsd/net/if_fake_var.h`, and
 //! `bsd/netinet/in_var.h`).
 
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, clippy::struct_field_names)]
 
-use std::ffi::CStr;
-use std::io;
-use std::mem;
-use std::net::Ipv4Addr;
+use std::{ffi::CStr, io, mem, net::Ipv4Addr};
 
 // ── Constants (bsd/net/if.h) ──
 
@@ -38,7 +35,7 @@ pub struct ifdrv {
     pub ifd_data: *mut libc::c_void,
 }
 
-/// `struct if_fake_request` (bsd/net/if_fake_var.h, private) — 160 bytes.
+/// `struct if_fake_request` (`bsd/net/if_fake_var.h`, private) — 160 bytes.
 ///
 /// Layout: 32 bytes reserved + 128-byte union containing `iffr_peer_name`.
 /// Private kernel struct, not available in any public SDK.
@@ -46,12 +43,12 @@ pub struct ifdrv {
 pub struct if_fake_request {
     pub iffr_reserved: [u64; 4],
     pub iffr_peer_name: [libc::c_char; libc::IFNAMSIZ],
-    pub _pad: [u8; 128 - libc::IFNAMSIZ],
+    pub pad: [u8; 128 - libc::IFNAMSIZ],
 }
 
-/// `struct in_aliasreq` (bsd/netinet/in_var.h) — 64 bytes.
+/// `struct in_aliasreq` (`bsd/netinet/in_var.h`) — 64 bytes.
 ///
-/// 16-byte name + 3 × sockaddr_in. Not available in `libc` for macOS targets.
+/// 16-byte name + 3 × `sockaddr_in`. Not available in `libc` for macOS targets.
 #[repr(C)]
 pub struct in_aliasreq {
     pub ifra_name: [libc::c_char; libc::IFNAMSIZ],

@@ -1,2 +1,2 @@
 pub mod feth;
-pub mod xnu;
+mod xnu;
