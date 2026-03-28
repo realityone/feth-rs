@@ -1,24 +1,42 @@
 use std::fmt;
-use std::process::Command;
-use std::sync::Arc;
+use std::io;
+use std::mem;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
 
-/// Errors that can occur during feth interface operations.
+use crate::xnu;
+
+// ── Error type ──
+
 #[derive(Debug)]
 pub enum Error {
-    /// The ifconfig command failed with a non-zero exit code.
-    IfconfigFailed { stderr: String },
-    /// Failed to spawn the ifconfig process.
-    Spawn(std::io::Error),
-    /// Failed to parse ifconfig output.
-    Parse(String),
+    Ioctl {
+        operation: &'static str,
+        source: io::Error,
+    },
+    InvalidName(String),
+    InvalidAddress {
+        input: String,
+        source: std::net::AddrParseError,
+    },
+    InvalidPrefixLen(u8),
+    Socket(io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::IfconfigFailed { stderr } => write!(f, "ifconfig failed: {stderr}"),
-            Error::Spawn(e) => write!(f, "failed to spawn ifconfig: {e}"),
-            Error::Parse(msg) => write!(f, "parse error: {msg}"),
+            Error::Ioctl { operation, source } => {
+                write!(f, "ioctl {operation} failed: {source}")
+            }
+            Error::InvalidName(name) => write!(f, "invalid interface name: {name}"),
+            Error::InvalidAddress { input, source } => {
+                write!(f, "invalid address: {input}: {source}")
+            }
+            Error::InvalidPrefixLen(len) => {
+                write!(f, "invalid prefix length: {len} (must be 0-32)")
+            }
+            Error::Socket(e) => write!(f, "failed to create socket: {e}"),
         }
     }
 }
@@ -26,118 +44,142 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Spawn(e) => Some(e),
+            Error::Ioctl { source, .. } | Error::Socket(source) => Some(source),
+            Error::InvalidAddress { source, .. } => Some(source),
             _ => None,
         }
     }
 }
 
-impl From<std::io::Error> for Error {
-    fn from(e: std::io::Error) -> Self {
-        Error::Spawn(e)
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Socket(e)
     }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Trait abstracting ifconfig command execution, allowing mock implementations for testing.
-pub trait Executor: fmt::Debug {
-    fn run_ifconfig(&self, args: &[&str]) -> Result<String>;
-}
+// ── Internal helpers ──
 
-/// Default executor that spawns a real `ifconfig` process.
-#[derive(Debug, Clone)]
-pub struct SystemExecutor;
-
-impl Executor for SystemExecutor {
-    fn run_ifconfig(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("ifconfig").args(args).output()?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(Error::IfconfigFailed { stderr });
-        }
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+fn ioctl_err(op: &'static str) -> impl FnOnce(nix::errno::Errno) -> Error {
+    move |e| Error::Ioctl {
+        operation: op,
+        source: e.into(),
     }
 }
 
-/// Status information for a feth interface.
+fn validate_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() >= libc::IFNAMSIZ {
+        return Err(Error::InvalidName(name.to_string()));
+    }
+    Ok(())
+}
+
+fn validate_prefix_len(prefix_len: u8) -> Result<()> {
+    if prefix_len > 32 {
+        return Err(Error::InvalidPrefixLen(prefix_len));
+    }
+    Ok(())
+}
+
+fn parse_addr(addr: &str) -> Result<Ipv4Addr> {
+    Ipv4Addr::from_str(addr).map_err(|e| Error::InvalidAddress {
+        input: addr.to_string(),
+        source: e,
+    })
+}
+
+fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
+    if prefix_len == 0 {
+        Ipv4Addr::UNSPECIFIED
+    } else {
+        Ipv4Addr::from(!0u32 << (32 - prefix_len))
+    }
+}
+
+fn broadcast_addr(addr: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
+    Ipv4Addr::from(u32::from(addr) | !u32::from(mask))
+}
+
+// ── Public types ──
+
+/// Status information for a feth interface, queried via ioctl.
 #[derive(Debug, Clone)]
 pub struct FethStatus {
     pub name: String,
-    pub flags: String,
-    pub mtu: Option<u32>,
-    pub ether: Option<String>,
+    pub flags: u16,
+    pub mtu: u32,
     pub peer: Option<String>,
-    pub inet: Option<String>,
-    pub netmask: Option<String>,
+    pub inet: Option<Ipv4Addr>,
+    pub netmask: Option<Ipv4Addr>,
 }
+
+impl FethStatus {
+    pub fn is_up(&self) -> bool {
+        self.flags & (xnu::IFF_UP as u16) != 0
+    }
+}
+
+// ── Feth interface handle ──
 
 /// A handle representing a feth (fake ethernet) interface.
 ///
-/// Created via [`Feth::create`] or [`Feth::from_existing`].
+/// All operations use direct `ioctl()` system calls (via the `nix` crate)
+/// rather than spawning `ifconfig` subprocesses.
 #[derive(Debug, Clone)]
 pub struct Feth {
     name: String,
-    executor: Arc<dyn Executor>,
 }
 
 impl Feth {
     /// Create a new feth interface with the given unit number.
     ///
-    /// Runs `ifconfig feth<unit> create`.
+    /// Issues `SIOCIFCREATE2` with name `"feth<unit>"`.
     pub fn create(unit: u32) -> Result<Self> {
-        Self::create_with(unit, Arc::new(SystemExecutor))
+        let name = format!("feth{unit}");
+        validate_name(&name)?;
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq(&name);
+            unsafe { xnu::ioctl::siocifcreate2(fd, &mut ifr) }
+                .map_err(ioctl_err("SIOCIFCREATE2"))?;
+            let actual_name = xnu::read_name(&ifr.ifr_name);
+            Ok(Self { name: actual_name })
+        })
     }
 
     /// Create a new feth interface with an auto-assigned unit number.
     ///
-    /// Runs `ifconfig feth create` and parses the returned interface name.
+    /// Issues `SIOCIFCREATE2` with name `"feth"`. The kernel assigns the
+    /// next available unit number and returns the full name.
     pub fn create_auto() -> Result<Self> {
-        Self::create_auto_with(Arc::new(SystemExecutor))
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq("feth");
+            unsafe { xnu::ioctl::siocifcreate2(fd, &mut ifr) }
+                .map_err(ioctl_err("SIOCIFCREATE2"))?;
+            let actual_name = xnu::read_name(&ifr.ifr_name);
+            if actual_name.is_empty() {
+                return Err(Error::InvalidName(
+                    "empty name returned by kernel".to_string(),
+                ));
+            }
+            Ok(Self { name: actual_name })
+        })
     }
 
-    /// Create a new feth interface with a peer set at creation time.
+    /// Create a new feth interface and immediately set its peer.
     ///
-    /// Runs `ifconfig feth<unit> create peer <peer_name>`.
+    /// Equivalent to `ifconfig feth<unit> create peer <peer_name>`.
     pub fn create_with_peer(unit: u32, peer_name: &str) -> Result<Self> {
-        Self::create_with_peer_using(unit, peer_name, Arc::new(SystemExecutor))
+        let feth = Self::create(unit)?;
+        feth.set_peer(peer_name)?;
+        Ok(feth)
     }
 
-    /// Wrap an existing feth interface by name.
-    pub fn from_existing(name: impl Into<String>) -> Self {
-        Self::from_existing_with(name, Arc::new(SystemExecutor))
-    }
-
-    fn create_with(unit: u32, executor: Arc<dyn Executor>) -> Result<Self> {
-        let name = format!("feth{unit}");
-        executor.run_ifconfig(&[&name, "create"])?;
-        Ok(Self { name, executor })
-    }
-
-    fn create_auto_with(executor: Arc<dyn Executor>) -> Result<Self> {
-        let output = executor.run_ifconfig(&["feth", "create"])?;
-        let name = output.trim().to_string();
-        if name.is_empty() {
-            return Err(Error::Parse("empty interface name from create".into()));
-        }
-        Ok(Self { name, executor })
-    }
-
-    fn create_with_peer_using(
-        unit: u32,
-        peer_name: &str,
-        executor: Arc<dyn Executor>,
-    ) -> Result<Self> {
-        let name = format!("feth{unit}");
-        executor.run_ifconfig(&[&name, "create", "peer", peer_name])?;
-        Ok(Self { name, executor })
-    }
-
-    fn from_existing_with(name: impl Into<String>, executor: Arc<dyn Executor>) -> Self {
-        Self {
-            name: name.into(),
-            executor,
-        }
+    /// Wrap an existing feth interface by name (no ioctl issued).
+    pub fn from_existing(name: impl Into<String>) -> Result<Self> {
+        let name = name.into();
+        validate_name(&name)?;
+        Ok(Self { name })
     }
 
     /// Return the interface name (e.g. `"feth0"`).
@@ -147,86 +189,215 @@ impl Feth {
 
     /// Destroy this feth interface.
     ///
-    /// Runs `ifconfig <name> destroy`.
+    /// Issues `SIOCIFDESTROY`.
     pub fn destroy(&self) -> Result<()> {
-        self.executor.run_ifconfig(&[&self.name, "destroy"])?;
-        Ok(())
+        xnu::with_socket(|fd| {
+            let ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocifdestroy(fd, &ifr) }.map_err(ioctl_err("SIOCIFDESTROY"))?;
+            Ok(())
+        })
     }
 
     /// Set the peer for this interface.
     ///
-    /// Runs `ifconfig <name> peer <peer_name>`.
+    /// Issues `SIOCSDRVSPEC` with `IF_FAKE_S_CMD_SET_PEER`.
     pub fn set_peer(&self, peer_name: &str) -> Result<()> {
-        self.executor
-            .run_ifconfig(&[&self.name, "peer", peer_name])?;
-        Ok(())
+        validate_name(peer_name)?;
+        xnu::with_socket(|fd| {
+            let mut iffr: xnu::if_fake_request = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut iffr.iffr_peer_name, peer_name);
+
+            let mut ifd: xnu::ifdrv = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut ifd.ifd_name, &self.name);
+            ifd.ifd_cmd = xnu::IF_FAKE_S_CMD_SET_PEER;
+            ifd.ifd_len = size_of::<xnu::if_fake_request>();
+            ifd.ifd_data = &mut iffr as *mut xnu::if_fake_request as *mut libc::c_void;
+
+            unsafe { xnu::ioctl::siocsdrvspec(fd, &ifd) }
+                .map_err(ioctl_err("SIOCSDRVSPEC set peer"))?;
+            Ok(())
+        })
     }
 
     /// Remove the peer association.
     ///
-    /// Runs `ifconfig <name> -peer`.
+    /// Issues `SIOCSDRVSPEC` with `IF_FAKE_S_CMD_SET_PEER` and an empty
+    /// peer name, which the kernel interprets as "clear the peer".
     pub fn remove_peer(&self) -> Result<()> {
-        self.executor.run_ifconfig(&[&self.name, "-peer"])?;
-        Ok(())
+        xnu::with_socket(|fd| {
+            let mut iffr: xnu::if_fake_request = unsafe { mem::zeroed() };
+            // iffr_peer_name stays all zeros = empty string → clears peer
+
+            let mut ifd: xnu::ifdrv = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut ifd.ifd_name, &self.name);
+            ifd.ifd_cmd = xnu::IF_FAKE_S_CMD_SET_PEER;
+            ifd.ifd_len = size_of::<xnu::if_fake_request>();
+            ifd.ifd_data = &mut iffr as *mut xnu::if_fake_request as *mut libc::c_void;
+
+            unsafe { xnu::ioctl::siocsdrvspec(fd, &ifd) }
+                .map_err(ioctl_err("SIOCSDRVSPEC remove peer"))?;
+            Ok(())
+        })
     }
 
-    /// Set an IPv4 address with a prefix length on this interface.
+    /// Get the current peer name, if any.
     ///
-    /// Runs `ifconfig <name> inet <addr>/<prefix>`.
+    /// Issues `SIOCGDRVSPEC` with `IF_FAKE_G_CMD_GET_PEER`.
+    pub fn get_peer(&self) -> Result<Option<String>> {
+        xnu::with_socket(|fd| {
+            let mut iffr: xnu::if_fake_request = unsafe { mem::zeroed() };
+
+            let mut ifd: xnu::ifdrv = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut ifd.ifd_name, &self.name);
+            ifd.ifd_cmd = xnu::IF_FAKE_G_CMD_GET_PEER;
+            ifd.ifd_len = size_of::<xnu::if_fake_request>();
+            ifd.ifd_data = &mut iffr as *mut xnu::if_fake_request as *mut libc::c_void;
+
+            unsafe { xnu::ioctl::siocgdrvspec(fd, &mut ifd) }
+                .map_err(ioctl_err("SIOCGDRVSPEC get peer"))?;
+
+            let name = xnu::read_name(&iffr.iffr_peer_name);
+            if name.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(name))
+            }
+        })
+    }
+
+    /// Set an IPv4 address with prefix length on this interface.
+    ///
+    /// Issues `SIOCAIFADDR` with the address, broadcast, and netmask
+    /// derived from `addr` and `prefix_len`.
     pub fn set_inet(&self, addr: &str, prefix_len: u8) -> Result<()> {
-        let cidr = format!("{addr}/{prefix_len}");
-        self.executor
-            .run_ifconfig(&[&self.name, "inet", &cidr])?;
-        Ok(())
+        validate_prefix_len(prefix_len)?;
+        let ip = parse_addr(addr)?;
+        let mask = prefix_to_mask(prefix_len);
+        let bcast = broadcast_addr(ip, mask);
+
+        xnu::with_socket(|fd| {
+            let mut req: xnu::in_aliasreq = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut req.ifra_name, &self.name);
+            req.ifra_addr = xnu::make_sockaddr_in(ip);
+            req.ifra_broadaddr = xnu::make_sockaddr_in(bcast);
+            req.ifra_mask = xnu::make_sockaddr_in(mask);
+
+            unsafe { xnu::ioctl::siocaifaddr(fd, &req) }.map_err(ioctl_err("SIOCAIFADDR"))?;
+            Ok(())
+        })
     }
 
     /// Set the MTU for this interface.
     ///
-    /// Runs `ifconfig <name> mtu <mtu>`.
+    /// Issues `SIOCSIFMTU`.
     pub fn set_mtu(&self, mtu: u32) -> Result<()> {
-        let mtu_str = mtu.to_string();
-        self.executor
-            .run_ifconfig(&[&self.name, "mtu", &mtu_str])?;
-        Ok(())
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq(&self.name);
+            ifr.ifr_ifru.ifru_mtu = mtu as libc::c_int;
+            unsafe { xnu::ioctl::siocsifmtu(fd, &ifr) }.map_err(ioctl_err("SIOCSIFMTU"))?;
+            Ok(())
+        })
     }
 
     /// Bring the interface up.
     ///
-    /// Runs `ifconfig <name> up`.
+    /// Issues `SIOCGIFFLAGS` then `SIOCSIFFLAGS` with `IFF_UP` set.
     pub fn up(&self) -> Result<()> {
-        self.executor.run_ifconfig(&[&self.name, "up"])?;
-        Ok(())
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocgifflags(fd, &mut ifr) }.map_err(ioctl_err("SIOCGIFFLAGS"))?;
+            unsafe { ifr.ifr_ifru.ifru_flags |= xnu::IFF_UP };
+            unsafe { xnu::ioctl::siocsifflags(fd, &ifr) }.map_err(ioctl_err("SIOCSIFFLAGS"))?;
+            Ok(())
+        })
     }
 
     /// Bring the interface down.
     ///
-    /// Runs `ifconfig <name> down`.
+    /// Issues `SIOCGIFFLAGS` then `SIOCSIFFLAGS` with `IFF_UP` cleared.
     pub fn down(&self) -> Result<()> {
-        self.executor.run_ifconfig(&[&self.name, "down"])?;
-        Ok(())
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocgifflags(fd, &mut ifr) }.map_err(ioctl_err("SIOCGIFFLAGS"))?;
+            unsafe { ifr.ifr_ifru.ifru_flags &= !xnu::IFF_UP };
+            unsafe { xnu::ioctl::siocsifflags(fd, &ifr) }.map_err(ioctl_err("SIOCSIFFLAGS"))?;
+            Ok(())
+        })
     }
 
-    /// Configure the interface in one shot: set peer, address, and bring it up.
-    ///
-    /// Runs `ifconfig <name> peer <peer> inet <addr>/<prefix> up`.
+    /// Configure the interface in one shot: set peer, assign address, bring up.
     pub fn configure(&self, peer_name: &str, addr: &str, prefix_len: u8) -> Result<()> {
-        let cidr = format!("{addr}/{prefix_len}");
-        self.executor
-            .run_ifconfig(&[&self.name, "peer", peer_name, "inet", &cidr, "up"])?;
-        Ok(())
+        self.set_peer(peer_name)?;
+        self.set_inet(addr, prefix_len)?;
+        self.up()
     }
 
-    /// Get the current status of this interface by parsing `ifconfig <name>` output.
+    /// Query the current status of this interface via ioctl.
     pub fn status(&self) -> Result<FethStatus> {
-        let output = self.executor.run_ifconfig(&[&self.name])?;
-        parse_status(&self.name, &output)
+        xnu::with_socket(|fd| {
+            // Flags
+            let mut ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocgifflags(fd, &mut ifr) }.map_err(ioctl_err("SIOCGIFFLAGS"))?;
+            let flags = unsafe { ifr.ifr_ifru.ifru_flags } as u16;
+
+            // MTU
+            let mut ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocgifmtu(fd, &mut ifr) }.map_err(ioctl_err("SIOCGIFMTU"))?;
+            let mtu = unsafe { ifr.ifr_ifru.ifru_mtu } as u32;
+
+            // Peer (via driver-specific ioctl)
+            let peer = {
+                let mut iffr: xnu::if_fake_request = unsafe { mem::zeroed() };
+                let mut ifd: xnu::ifdrv = unsafe { mem::zeroed() };
+                xnu::copy_name(&mut ifd.ifd_name, &self.name);
+                ifd.ifd_cmd = xnu::IF_FAKE_G_CMD_GET_PEER;
+                ifd.ifd_len = size_of::<xnu::if_fake_request>();
+                ifd.ifd_data = &mut iffr as *mut xnu::if_fake_request as *mut libc::c_void;
+
+                if unsafe { xnu::ioctl::siocgdrvspec(fd, &mut ifd) }.is_ok() {
+                    let name = xnu::read_name(&iffr.iffr_peer_name);
+                    if name.is_empty() { None } else { Some(name) }
+                } else {
+                    None
+                }
+            };
+
+            // IPv4 address (may fail if none configured)
+            let inet = {
+                let mut ifr = xnu::make_ifreq(&self.name);
+                if unsafe { xnu::ioctl::siocgifaddr(fd, &mut ifr) }.is_ok() {
+                    xnu::ifreq_get_addr(&ifr)
+                } else {
+                    None
+                }
+            };
+
+            // Netmask
+            let netmask = {
+                let mut ifr = xnu::make_ifreq(&self.name);
+                if unsafe { xnu::ioctl::siocgifnetmask(fd, &mut ifr) }.is_ok() {
+                    xnu::ifreq_get_addr(&ifr)
+                } else {
+                    None
+                }
+            };
+
+            Ok(FethStatus {
+                name: self.name.clone(),
+                flags,
+                mtu,
+                peer,
+                inet,
+                netmask,
+            })
+        })
     }
 }
 
 /// Create a linked pair of feth interfaces with assigned addresses.
 ///
-/// This is a convenience function that creates two feth interfaces, peers them,
-/// assigns addresses, and brings both up.
+/// Creates both interfaces, peers them bidirectionally, assigns addresses,
+/// and brings both up.
 pub fn create_pair(
     unit_a: u32,
     addr_a: &str,
@@ -234,393 +405,174 @@ pub fn create_pair(
     addr_b: &str,
     prefix_len: u8,
 ) -> Result<(Feth, Feth)> {
-    create_pair_with(
-        unit_a,
-        addr_a,
-        unit_b,
-        addr_b,
-        prefix_len,
-        Arc::new(SystemExecutor),
-    )
-}
+    validate_prefix_len(prefix_len)?;
+    parse_addr(addr_a)?;
+    parse_addr(addr_b)?;
 
-fn create_pair_with(
-    unit_a: u32,
-    addr_a: &str,
-    unit_b: u32,
-    addr_b: &str,
-    prefix_len: u8,
-    executor: Arc<dyn Executor>,
-) -> Result<(Feth, Feth)> {
-    let name_a = format!("feth{unit_a}");
-    let name_b = format!("feth{unit_b}");
-    let cidr_a = format!("{addr_a}/{prefix_len}");
-    let cidr_b = format!("{addr_b}/{prefix_len}");
-
-    executor.run_ifconfig(&[&name_a, "create", "peer", &name_b, "inet", &cidr_a, "up"])?;
-    executor.run_ifconfig(&[&name_b, "create", "peer", &name_a, "inet", &cidr_b, "up"])?;
-
-    Ok((
-        Feth {
-            name: name_a,
-            executor: executor.clone(),
-        },
-        Feth {
-            name: name_b,
-            executor,
-        },
-    ))
-}
-
-fn parse_status(name: &str, output: &str) -> Result<FethStatus> {
-    let mut status = FethStatus {
-        name: name.to_string(),
-        flags: String::new(),
-        mtu: None,
-        ether: None,
-        peer: None,
-        inet: None,
-        netmask: None,
+    let a = Feth::create(unit_a)?;
+    let b = match Feth::create(unit_b) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = a.destroy();
+            return Err(e);
+        }
     };
 
-    for line in output.lines() {
-        let trimmed = line.trim();
-
-        // First line: "feth0: flags=8843<UP,...> mtu 1500"
-        if trimmed.starts_with(&format!("{name}:")) {
-            if let Some(flags_start) = trimmed.find("flags=") {
-                if let Some(flags_end) = trimmed[flags_start..].find('>') {
-                    status.flags =
-                        trimmed[flags_start + 6..flags_start + flags_end + 1].to_string();
-                }
-            }
-            if let Some(mtu_idx) = trimmed.find("mtu ") {
-                if let Some(mtu_val) = trimmed[mtu_idx + 4..].split_whitespace().next() {
-                    status.mtu = mtu_val.parse().ok();
-                }
-            }
-        } else if trimmed.starts_with("ether ") {
-            status.ether = trimmed.strip_prefix("ether ").map(|s| s.trim().to_string());
-        } else if trimmed.starts_with("peer: ") {
-            let peer_val = trimmed.strip_prefix("peer: ").unwrap().trim();
-            if peer_val != "<none>" {
-                status.peer = Some(peer_val.to_string());
-            }
-        } else if trimmed.starts_with("inet ") {
-            let parts: Vec<&str> = trimmed.split_whitespace().collect();
-            if parts.len() >= 2 {
-                status.inet = Some(parts[1].to_string());
-            }
-            if let Some(pos) = parts.iter().position(|&p| p == "netmask") {
-                if pos + 1 < parts.len() {
-                    status.netmask = Some(parts[pos + 1].to_string());
-                }
-            }
-        }
+    // The kernel establishes the bidirectional link — only one side needs to set the peer.
+    if let Err(e) = a.set_peer(b.name()) {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        return Err(e);
     }
 
-    Ok(status)
+    if let Err(e) = a.set_inet(addr_a, prefix_len) {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        return Err(e);
+    }
+
+    if let Err(e) = b.set_inet(addr_b, prefix_len) {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        return Err(e);
+    }
+
+    if let Err(e) = a.up() {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        return Err(e);
+    }
+
+    if let Err(e) = b.up() {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        return Err(e);
+    }
+
+    Ok((a, b))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// A recorded invocation of ifconfig.
-    #[derive(Debug, Clone, PartialEq)]
-    struct Call {
-        args: Vec<String>,
-    }
-
-    /// Mock executor that records calls and returns pre-configured responses.
-    #[derive(Debug)]
-    struct MockExecutor {
-        calls: Mutex<Vec<Call>>,
-        responses: Mutex<Vec<Result<String>>>,
-    }
-
-    impl MockExecutor {
-        fn new(responses: Vec<std::result::Result<String, &str>>) -> Arc<Self> {
-            Arc::new(Self {
-                calls: Mutex::new(Vec::new()),
-                responses: Mutex::new(
-                    responses
-                        .into_iter()
-                        .rev() // reverse so we can pop from the end
-                        .map(|r| match r {
-                            Ok(s) => Ok(s),
-                            Err(e) => Err(Error::IfconfigFailed {
-                                stderr: e.to_string(),
-                            }),
-                        })
-                        .collect(),
-                ),
-            })
-        }
-
-        fn calls(&self) -> Vec<Call> {
-            self.calls.lock().unwrap().clone()
-        }
-    }
-
-    impl Executor for MockExecutor {
-        fn run_ifconfig(&self, args: &[&str]) -> Result<String> {
-            self.calls.lock().unwrap().push(Call {
-                args: args.iter().map(|s| s.to_string()).collect(),
-            });
-            self.responses
-                .lock()
-                .unwrap()
-                .pop()
-                .unwrap_or(Ok(String::new()))
-        }
-    }
-
-    fn args(a: &[&str]) -> Call {
-        Call {
-            args: a.iter().map(|s| s.to_string()).collect(),
-        }
-    }
-
-    // ── Creation tests ──
+    // ── Validation tests ──
 
     #[test]
-    fn test_create_with_unit() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::create_with(0, mock.clone()).unwrap();
+    fn test_validate_name_valid() {
+        assert!(validate_name("feth0").is_ok());
+        assert!(validate_name("feth123").is_ok());
+        assert!(validate_name("lo0").is_ok());
+        assert!(validate_name("a23456789012345").is_ok());
+    }
 
+    #[test]
+    fn test_validate_name_empty() {
+        assert!(matches!(validate_name(""), Err(Error::InvalidName(_))));
+    }
+
+    #[test]
+    fn test_validate_name_too_long() {
+        assert!(matches!(
+            validate_name("a234567890123456"),
+            Err(Error::InvalidName(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_prefix_len() {
+        assert!(validate_prefix_len(0).is_ok());
+        assert!(validate_prefix_len(24).is_ok());
+        assert!(validate_prefix_len(32).is_ok());
+        assert!(matches!(
+            validate_prefix_len(33),
+            Err(Error::InvalidPrefixLen(33))
+        ));
+    }
+
+    #[test]
+    fn test_parse_addr_valid() {
+        assert_eq!(parse_addr("10.0.0.1").unwrap(), Ipv4Addr::new(10, 0, 0, 1));
+        assert_eq!(
+            parse_addr("192.168.1.1").unwrap(),
+            Ipv4Addr::new(192, 168, 1, 1)
+        );
+    }
+
+    #[test]
+    fn test_parse_addr_invalid() {
+        assert!(matches!(
+            parse_addr("not-an-ip"),
+            Err(Error::InvalidAddress { .. })
+        ));
+        assert!(matches!(
+            parse_addr("256.0.0.1"),
+            Err(Error::InvalidAddress { .. })
+        ));
+    }
+
+    // ── Netmask / broadcast computation ──
+
+    #[test]
+    fn test_prefix_to_mask() {
+        assert_eq!(prefix_to_mask(0), Ipv4Addr::new(0, 0, 0, 0));
+        assert_eq!(prefix_to_mask(8), Ipv4Addr::new(255, 0, 0, 0));
+        assert_eq!(prefix_to_mask(16), Ipv4Addr::new(255, 255, 0, 0));
+        assert_eq!(prefix_to_mask(24), Ipv4Addr::new(255, 255, 255, 0));
+        assert_eq!(prefix_to_mask(32), Ipv4Addr::new(255, 255, 255, 255));
+        assert_eq!(prefix_to_mask(25), Ipv4Addr::new(255, 255, 255, 128));
+    }
+
+    #[test]
+    fn test_broadcast_addr() {
+        let addr = Ipv4Addr::new(10, 0, 0, 1);
+        let mask = prefix_to_mask(24);
+        assert_eq!(broadcast_addr(addr, mask), Ipv4Addr::new(10, 0, 0, 255));
+
+        let addr = Ipv4Addr::new(192, 168, 1, 100);
+        let mask = prefix_to_mask(16);
+        assert_eq!(
+            broadcast_addr(addr, mask),
+            Ipv4Addr::new(192, 168, 255, 255)
+        );
+    }
+
+    // ── from_existing validation ──
+
+    #[test]
+    fn test_from_existing_valid() {
+        let feth = Feth::from_existing("feth0").unwrap();
         assert_eq!(feth.name(), "feth0");
-        assert_eq!(mock.calls(), vec![args(&["feth0", "create"])]);
     }
 
     #[test]
-    fn test_create_auto() {
-        let mock = MockExecutor::new(vec![Ok("feth3\n".into())]);
-        let feth = Feth::create_auto_with(mock.clone()).unwrap();
-
-        assert_eq!(feth.name(), "feth3");
-        assert_eq!(mock.calls(), vec![args(&["feth", "create"])]);
+    fn test_from_existing_invalid_name() {
+        assert!(Feth::from_existing("").is_err());
+        assert!(Feth::from_existing("a234567890123456").is_err());
     }
 
-    #[test]
-    fn test_create_auto_empty_output() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let err = Feth::create_auto_with(mock).unwrap_err();
-
-        assert!(matches!(err, Error::Parse(_)));
-    }
+    // ── FethStatus helpers ──
 
     #[test]
-    fn test_create_with_peer() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::create_with_peer_using(0, "feth1", mock.clone()).unwrap();
+    fn test_feth_status_is_up() {
+        let status = FethStatus {
+            name: "feth0".into(),
+            flags: xnu::IFF_UP as u16,
+            mtu: 1500,
+            peer: None,
+            inet: None,
+            netmask: None,
+        };
+        assert!(status.is_up());
 
-        assert_eq!(feth.name(), "feth0");
-        assert_eq!(
-            mock.calls(),
-            vec![args(&["feth0", "create", "peer", "feth1"])]
-        );
-    }
-
-    #[test]
-    fn test_create_ifconfig_failure() {
-        let mock = MockExecutor::new(vec![Err("interface already exists")]);
-        let err = Feth::create_with(0, mock).unwrap_err();
-
-        match err {
-            Error::IfconfigFailed { stderr } => {
-                assert!(stderr.contains("interface already exists"));
-            }
-            other => panic!("expected IfconfigFailed, got: {other:?}"),
-        }
-    }
-
-    // ── Destroy tests ──
-
-    #[test]
-    fn test_destroy() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.destroy().unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "destroy"])]);
-    }
-
-    #[test]
-    fn test_destroy_failure() {
-        let mock = MockExecutor::new(vec![Err("interface does not exist")]);
-        let feth = Feth::from_existing_with("feth99", mock.clone());
-
-        let err = feth.destroy().unwrap_err();
-        assert!(matches!(err, Error::IfconfigFailed { .. }));
-    }
-
-    // ── Peer tests ──
-
-    #[test]
-    fn test_set_peer() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.set_peer("feth1").unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "peer", "feth1"])]);
-    }
-
-    #[test]
-    fn test_remove_peer() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.remove_peer().unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "-peer"])]);
-    }
-
-    // ── Param setting tests ──
-
-    #[test]
-    fn test_set_inet() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.set_inet("10.0.0.1", 24).unwrap();
-        assert_eq!(
-            mock.calls(),
-            vec![args(&["feth0", "inet", "10.0.0.1/24"])]
-        );
-    }
-
-    #[test]
-    fn test_set_mtu() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.set_mtu(9000).unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "mtu", "9000"])]);
-    }
-
-    #[test]
-    fn test_up() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.up().unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "up"])]);
-    }
-
-    #[test]
-    fn test_down() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.down().unwrap();
-        assert_eq!(mock.calls(), vec![args(&["feth0", "down"])]);
-    }
-
-    #[test]
-    fn test_configure() {
-        let mock = MockExecutor::new(vec![Ok(String::new())]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        feth.configure("feth1", "10.0.0.1", 24).unwrap();
-        assert_eq!(
-            mock.calls(),
-            vec![args(&["feth0", "peer", "feth1", "inet", "10.0.0.1/24", "up"])]
-        );
-    }
-
-    // ── Status tests ──
-
-    #[test]
-    fn test_status() {
-        let output = "\
-feth0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-\tether 02:00:00:00:00:00
-\tpeer: feth1
-\tinet 10.0.0.1 netmask 0xffffff00 broadcast 10.0.0.255
-"
-        .to_string();
-        let mock = MockExecutor::new(vec![Ok(output)]);
-        let feth = Feth::from_existing_with("feth0", mock.clone());
-
-        let st = feth.status().unwrap();
-        assert_eq!(st.name, "feth0");
-        assert_eq!(st.flags, "8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
-        assert_eq!(st.mtu, Some(1500));
-        assert_eq!(st.ether.as_deref(), Some("02:00:00:00:00:00"));
-        assert_eq!(st.peer.as_deref(), Some("feth1"));
-        assert_eq!(st.inet.as_deref(), Some("10.0.0.1"));
-        assert_eq!(st.netmask.as_deref(), Some("0xffffff00"));
-        assert_eq!(mock.calls(), vec![args(&["feth0"])]);
-    }
-
-    // ── create_pair tests ──
-
-    #[test]
-    fn test_create_pair() {
-        let mock = MockExecutor::new(vec![Ok(String::new()), Ok(String::new())]);
-        let (a, b) =
-            create_pair_with(0, "10.0.0.1", 1, "10.0.0.2", 24, mock.clone()).unwrap();
-
-        assert_eq!(a.name(), "feth0");
-        assert_eq!(b.name(), "feth1");
-        assert_eq!(
-            mock.calls(),
-            vec![
-                args(&["feth0", "create", "peer", "feth1", "inet", "10.0.0.1/24", "up"]),
-                args(&["feth1", "create", "peer", "feth0", "inet", "10.0.0.2/24", "up"]),
-            ]
-        );
-    }
-
-    #[test]
-    fn test_create_pair_second_fails() {
-        let mock = MockExecutor::new(vec![Ok(String::new()), Err("feth1 already exists")]);
-        let err = create_pair_with(0, "10.0.0.1", 1, "10.0.0.2", 24, mock).unwrap_err();
-
-        assert!(matches!(err, Error::IfconfigFailed { .. }));
-    }
-
-    // ── Parse tests ──
-
-    #[test]
-    fn test_parse_status_full() {
-        let output = "\
-feth0: flags=8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-\tether 02:00:00:00:00:00
-\tpeer: feth1
-\tinet 10.0.0.1 netmask 0xffffff00 broadcast 10.0.0.255
-";
-        let status = parse_status("feth0", output).unwrap();
-        assert_eq!(status.name, "feth0");
-        assert_eq!(status.flags, "8843<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>");
-        assert_eq!(status.mtu, Some(1500));
-        assert_eq!(status.ether.as_deref(), Some("02:00:00:00:00:00"));
-        assert_eq!(status.peer.as_deref(), Some("feth1"));
-        assert_eq!(status.inet.as_deref(), Some("10.0.0.1"));
-        assert_eq!(status.netmask.as_deref(), Some("0xffffff00"));
-    }
-
-    #[test]
-    fn test_parse_status_no_peer() {
-        let output = "\
-feth0: flags=8802<BROADCAST,SIMPLEX,MULTICAST> mtu 1500
-\tether 02:00:00:00:00:00
-\tpeer: <none>
-";
-        let status = parse_status("feth0", output).unwrap();
-        assert!(status.peer.is_none());
-        assert!(status.inet.is_none());
-    }
-
-    #[test]
-    fn test_parse_status_minimal() {
-        let output = "feth5: flags=0<> mtu 9000\n";
-        let status = parse_status("feth5", output).unwrap();
-        assert_eq!(status.name, "feth5");
-        assert_eq!(status.flags, "0<>");
-        assert_eq!(status.mtu, Some(9000));
-        assert!(status.ether.is_none());
-        assert!(status.peer.is_none());
+        let status = FethStatus {
+            name: "feth0".into(),
+            flags: 0,
+            mtu: 1500,
+            peer: None,
+            inet: None,
+            netmask: None,
+        };
+        assert!(!status.is_up());
     }
 }
