@@ -14,7 +14,7 @@ feth interfaces are virtual ethernet interfaces available on macOS that can be p
 
 ## Architecture
 
-A feth pair consists of two interfaces linked as peers:
+A feth pair consists of two interfaces linked as peers. Setting the peer on one side automatically establishes the bidirectional link:
 
 ```
 ┌─────────────────────┐         ┌─────────────────────┐
@@ -115,11 +115,12 @@ sudo cargo run --example fethctl --features tokio -- create 0 101
 
 This creates `feth0` and `feth101`.
 
-**Step 2: Peer them together**
+**Step 2: Peer them**
+
+Setting the peer on one side automatically establishes the bidirectional link.
 
 ```bash
 sudo cargo run --example fethctl --features tokio -- set feth0 --peer feth101
-sudo cargo run --example fethctl --features tokio -- set feth101 --peer feth0
 ```
 
 **Step 3: Configure the virtual side with an IP address and bring it up**
