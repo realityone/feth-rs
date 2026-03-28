@@ -401,21 +401,25 @@ impl Feth {
     }
 }
 
-/// Create a linked pair of feth interfaces with assigned addresses.
-///
-/// Creates both interfaces, peers them bidirectionally, assigns addresses,
-/// and brings both up.
-pub fn create_pair(
-    unit_a: u32,
-    addr_a: &str,
-    unit_b: u32,
-    addr_b: &str,
-    prefix_len: u8,
-) -> Result<(Feth, Feth)> {
-    validate_prefix_len(prefix_len)?;
-    parse_addr(addr_a)?;
-    parse_addr(addr_b)?;
+/// Configuration for one side of a feth pair.
+#[derive(Clone, Copy, Default)]
+pub struct FethPairSide<'a> {
+    /// IPv4 address (e.g. `"10.0.0.1"`).
+    pub addr: Option<&'a str>,
+    /// Subnet prefix length (e.g. `24`). Required if `addr` is set.
+    pub prefix_len: Option<u8>,
+    /// MTU to set on this interface.
+    pub mtu: Option<u32>,
+    /// Whether to bring the interface up (default: not changed).
+    pub up: Option<bool>,
+}
 
+/// Create a linked pair of feth interfaces.
+///
+/// Creates both interfaces and peers them bidirectionally. Address
+/// assignment, MTU, and link state are applied per-side when specified.
+/// On any failure the interfaces are destroyed before returning.
+pub fn create_pair(unit_a: u32, side_a: FethPairSide<'_>, unit_b: u32, side_b: FethPairSide<'_>) -> Result<(Feth, Feth)> {
     let a = Feth::create(unit_a)?;
     let b = match Feth::create(unit_b) {
         Ok(b) => b,
@@ -425,35 +429,29 @@ pub fn create_pair(
         }
     };
 
+    let cleanup = |e| {
+        let _ = b.destroy();
+        let _ = a.destroy();
+        e
+    };
+
     // The kernel establishes the bidirectional link — only one side needs to set the peer.
-    if let Err(e) = a.set_peer(b.name()) {
-        let _ = b.destroy();
-        let _ = a.destroy();
-        return Err(e);
-    }
+    a.set_peer(b.name()).map_err(&cleanup)?;
 
-    if let Err(e) = a.set_inet(addr_a, prefix_len) {
-        let _ = b.destroy();
-        let _ = a.destroy();
-        return Err(e);
-    }
-
-    if let Err(e) = b.set_inet(addr_b, prefix_len) {
-        let _ = b.destroy();
-        let _ = a.destroy();
-        return Err(e);
-    }
-
-    if let Err(e) = a.up() {
-        let _ = b.destroy();
-        let _ = a.destroy();
-        return Err(e);
-    }
-
-    if let Err(e) = b.up() {
-        let _ = b.destroy();
-        let _ = a.destroy();
-        return Err(e);
+    for (feth, side) in [(&a, &side_a), (&b, &side_b)] {
+        if let Some(addr) = side.addr {
+            let prefix_len = side.prefix_len.unwrap_or(24);
+            feth.set_inet(addr, prefix_len).map_err(&cleanup)?;
+        }
+        if let Some(mtu) = side.mtu {
+            feth.set_mtu(mtu).map_err(&cleanup)?;
+        }
+        if let Some(true) = side.up {
+            feth.up().map_err(&cleanup)?;
+        }
+        if let Some(false) = side.up {
+            feth.down().map_err(&cleanup)?;
+        }
     }
 
     Ok((a, b))
