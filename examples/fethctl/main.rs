@@ -10,8 +10,9 @@ use std::{net::Ipv4Addr, process::ExitCode, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use feth_rs::{
+    feth_tokio::AsyncFethIO,
     feth::{Feth, FethStatus},
-    fethio::FethIO,
+    feth_io::FethIO,
 };
 use packet::{
     ArpOp, ArpPacket, EtherType, EthernetBuilder, EthernetFrame, IcmpEcho, IcmpType, Ipv4Builder,
@@ -164,7 +165,12 @@ fn print_frame(seq: u64, buf: &[u8]) {
 
 // ── ICMP responder ──
 
-fn handle_arp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io: &mut FethIO) -> std::io::Result<bool> {
+fn handle_arp(
+    frame: &EthernetFrame<'_>,
+    our_ip: Ipv4Addr,
+    our_mac: MacAddr,
+    io: &AsyncFethIO,
+) -> std::io::Result<bool> {
     let Some(arp) = ArpPacket::parse(frame.payload) else {
         return Ok(false);
     };
@@ -179,7 +185,12 @@ fn handle_arp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io:
     Ok(true)
 }
 
-fn handle_icmp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io: &mut FethIO) -> std::io::Result<bool> {
+fn handle_icmp(
+    frame: &EthernetFrame<'_>,
+    our_ip: Ipv4Addr,
+    our_mac: MacAddr,
+    io: &AsyncFethIO,
+) -> std::io::Result<bool> {
     let Some(ip) = Ipv4Packet::parse(frame.payload) else {
         return Ok(false);
     };
@@ -194,7 +205,8 @@ fn handle_icmp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io
     }
 
     let icmp_reply = echo.reply();
-    let ip_reply = Ipv4Builder::new(our_ip, ip.header.src(), Ipv4Header::PROTO_ICMP).build(&icmp_reply);
+    let ip_reply =
+        Ipv4Builder::new(our_ip, ip.header.src(), Ipv4Header::PROTO_ICMP).build(&icmp_reply);
     let eth_reply = EthernetBuilder::new(frame.src(), our_mac, EtherType::IPV4).build(&ip_reply);
     io.send(&eth_reply)?;
     println!(
@@ -207,23 +219,23 @@ fn handle_icmp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io
     Ok(true)
 }
 
-fn run_icmp_responder(name: &str, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_icmp_responder(name: &str, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
     let ip = Ipv4Addr::from_str(addr)?;
     let our_mac = MacAddr::from_ipv4(ip);
-    let mut io = FethIO::open(name)?;
+    let mut io = AsyncFethIO::open(name)?;
     let mut buf = vec![0u8; 65536];
     println!("listening on {name} as {ip} ({our_mac})");
     loop {
-        let n = io.recv(&mut buf)?;
+        let n = io.recv(&mut buf).await?;
         let Some(eth) = EthernetFrame::parse(&buf[..n]) else {
             continue;
         };
         match eth.ethertype() {
             EtherType::ARP => {
-                handle_arp(&eth, ip, our_mac, &mut io)?;
+                handle_arp(&eth, ip, our_mac, &io)?;
             }
             EtherType::IPV4 => {
-                handle_icmp(&eth, ip, our_mac, &mut io)?;
+                handle_icmp(&eth, ip, our_mac, &io)?;
             }
             _ => {}
         }
@@ -240,7 +252,7 @@ fn parse_cidr(s: &str) -> Result<(String, u8), Box<dyn std::error::Error>> {
     Ok((addr.to_string(), prefix_len))
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -322,15 +334,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Cmd::Icmp { name, addr } => {
-            run_icmp_responder(&name, &addr)?;
+            run_icmp_responder(&name, &addr).await?;
         }
     }
 
     Ok(())
 }
 
-fn main() -> ExitCode {
-    match run() {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> ExitCode {
+    match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");

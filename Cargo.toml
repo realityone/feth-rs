@@ -3,12 +3,21 @@ name = "feth-rs"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+tokio = ["dep:tokio"]
+
 [dependencies]
 libc = "0.2"
 nix = { version = "0.29", features = ["ioctl"] }
+tokio = { version = "1", features = ["net"], optional = true }
 
 [dev-dependencies]
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["net", "rt", "macros"] }
+
+[[example]]
+name = "fethctl"
+required-features = ["tokio"]
 
 [lints.clippy]
 all = { level = "warn", priority = -1 }

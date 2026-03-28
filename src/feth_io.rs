@@ -4,7 +4,7 @@
 //! `AF_NDRV` is used for sending because BPF limits injected packet MTU to 2048.
 
 use std::{
-    io::{self, Read, Write},
+    io::{self, IoSlice, Read, Write},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
 };
 
@@ -207,9 +207,30 @@ impl FethIO {
         self.ndrv.as_raw_fd()
     }
 
+    /// Decompose into the raw parts: `(name, bpf_fd, ndrv_fd)`.
+    pub fn into_parts(self) -> (String, OwnedFd, OwnedFd) {
+        (self.name, self.bpf, self.ndrv)
+    }
+
     /// Send a raw ethernet frame.
     pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
         let n = unsafe { libc::write(self.ndrv.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    /// Send a raw ethernet frame from multiple buffers (vectored write).
+    pub fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let n = unsafe {
+            libc::writev(
+                self.ndrv.as_raw_fd(),
+                bufs.as_ptr().cast(),
+                bufs.len() as libc::c_int,
+            )
+        };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
