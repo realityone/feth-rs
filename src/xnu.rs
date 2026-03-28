@@ -91,6 +91,8 @@ pub mod ioctl {
     nix::ioctl_write_ptr!(siocsifmtu, b'i', 52, libc::ifreq);
     // SIOCGIFMTU: _IOWR('i', 51, struct ifreq)
     nix::ioctl_readwrite!(siocgifmtu, b'i', 51, libc::ifreq);
+    // SIOCDIFADDR: _IOW('i', 25, struct ifreq)
+    nix::ioctl_write_ptr!(siocdifaddr, b'i', 25, libc::ifreq);
     // SIOCAIFADDR: _IOW('i', 26, struct in_aliasreq)
     nix::ioctl_write_ptr!(siocaifaddr, b'i', 26, in_aliasreq);
     // SIOCGIFADDR: _IOWR('i', 33, struct ifreq)

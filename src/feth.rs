@@ -283,6 +283,17 @@ impl Feth {
         })
     }
 
+    /// Remove the IPv4 address from this interface.
+    ///
+    /// Issues `SIOCDIFADDR`.
+    pub fn remove_inet(&self) -> Result<()> {
+        xnu::with_socket(|fd| {
+            let ifr = xnu::make_ifreq(&self.name);
+            unsafe { xnu::ioctl::siocdifaddr(fd, &ifr) }.map_err(ioctl_err("SIOCDIFADDR"))?;
+            Ok(())
+        })
+    }
+
     /// Set the MTU for this interface.
     ///
     /// Issues `SIOCSIFMTU`.

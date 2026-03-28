@@ -4,10 +4,19 @@
 //!
 //!     sudo cargo run --example fethctl -- <command>
 
-use std::{net::Ipv4Addr, process::ExitCode};
+mod packet;
+
+use std::{net::Ipv4Addr, process::ExitCode, str::FromStr};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use feth_rs::feth::{Feth, FethStatus};
+use feth_rs::{
+    feth::{Feth, FethStatus},
+    fethio::FethIO,
+};
+use packet::{
+    ArpOp, ArpPacket, EtherType, EthernetBuilder, EthernetFrame, IcmpEcho, IcmpType, Ipv4Builder,
+    Ipv4Header, Ipv4Packet, MacAddr,
+};
 
 #[derive(Parser)]
 #[command(
@@ -66,7 +75,24 @@ enum Cmd {
         /// Interface name (e.g. feth0).
         name: String,
     },
+
+    /// Capture and log L2 frames on a feth interface.
+    Capture {
+        /// Interface name (e.g. feth0).
+        name: String,
+    },
+
+    /// Respond to ARP and ICMP echo requests on a feth interface.
+    Icmp {
+        /// Interface name (e.g. feth101).
+        name: String,
+
+        /// IPv4 address to claim (e.g. 10.0.0.2).
+        addr: String,
+    },
 }
+
+// ── Status display ──
 
 const IFF_FLAGS: &[(u16, &str)] = &[
     (0x0001, "UP"),
@@ -101,10 +127,7 @@ fn netmask_to_prefix(mask: Ipv4Addr) -> u8 {
 }
 
 fn print_status(s: &FethStatus) {
-    // Line 1: name, flags, mtu
     println!("{}: flags={} mtu {}", s.name, format_flags(s.flags), s.mtu);
-
-    // inet line
     if let Some(addr) = s.inet {
         let prefix = s.netmask.map_or(0, netmask_to_prefix);
         let netmask_hex = s
@@ -113,18 +136,101 @@ fn print_status(s: &FethStatus) {
             .unwrap_or_default();
         println!("\tinet {addr} netmask {netmask_hex} prefix {prefix}");
     }
-
-    // peer line
     if let Some(peer) = &s.peer {
         println!("\tpeer: {peer}");
     }
-
-    // status line
     println!(
         "\tstatus: {}",
         if s.is_up() { "active" } else { "inactive" }
     );
 }
+
+// ── Capture display ──
+
+fn print_frame(seq: u64, buf: &[u8]) {
+    let Some(eth) = EthernetFrame::parse(buf) else {
+        println!("#{seq} <short frame, {len} bytes>", len = buf.len());
+        return;
+    };
+    let et = eth.ethertype();
+    println!(
+        "#{seq} {src} -> {dst}  {et} (0x{raw:04x})  {len} bytes",
+        src = eth.src(),
+        dst = eth.dst(),
+        raw = et.0,
+        len = buf.len(),
+    );
+}
+
+// ── ICMP responder ──
+
+fn handle_arp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io: &mut FethIO) -> std::io::Result<bool> {
+    let Some(arp) = ArpPacket::parse(frame.payload) else {
+        return Ok(false);
+    };
+    if arp.op() != ArpOp::REQUEST || arp.target_ip() != our_ip {
+        return Ok(false);
+    }
+
+    let reply = ArpPacket::reply(our_mac, our_ip, arp);
+    io.send(&reply.to_frame(arp.sender_mac))?;
+    println!("  ARP reply: {our_ip} is-at {our_mac}");
+    println!("    (to {} at {})", arp.sender_ip(), arp.sender_mac);
+    Ok(true)
+}
+
+fn handle_icmp(frame: &EthernetFrame<'_>, our_ip: Ipv4Addr, our_mac: MacAddr, io: &mut FethIO) -> std::io::Result<bool> {
+    let Some(ip) = Ipv4Packet::parse(frame.payload) else {
+        return Ok(false);
+    };
+    if ip.header.protocol() != Ipv4Header::PROTO_ICMP || ip.header.dst() != our_ip {
+        return Ok(false);
+    }
+    let Some(echo) = IcmpEcho::parse(ip.payload) else {
+        return Ok(false);
+    };
+    if echo.icmp_type() != IcmpType::ECHO_REQUEST {
+        return Ok(false);
+    }
+
+    let icmp_reply = echo.reply();
+    let ip_reply = Ipv4Builder::new(our_ip, ip.header.src(), Ipv4Header::PROTO_ICMP).build(&icmp_reply);
+    let eth_reply = EthernetBuilder::new(frame.src(), our_mac, EtherType::IPV4).build(&ip_reply);
+    io.send(&eth_reply)?;
+    println!(
+        "  ICMP reply: {our_ip} -> {src}  id={id} seq={seq} {len} bytes",
+        src = ip.header.src(),
+        id = echo.id(),
+        seq = echo.seq(),
+        len = icmp_reply.len(),
+    );
+    Ok(true)
+}
+
+fn run_icmp_responder(name: &str, addr: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let ip = Ipv4Addr::from_str(addr)?;
+    let our_mac = MacAddr::from_ipv4(ip);
+    let mut io = FethIO::open(name)?;
+    let mut buf = vec![0u8; 65536];
+    println!("listening on {name} as {ip} ({our_mac})");
+    loop {
+        let n = io.recv(&mut buf)?;
+        let Some(eth) = EthernetFrame::parse(&buf[..n]) else {
+            continue;
+        };
+        match eth.ethertype() {
+            EtherType::ARP => {
+                handle_arp(&eth, ip, our_mac, &mut io)?;
+            }
+            EtherType::IPV4 => {
+                handle_icmp(&eth, ip, our_mac, &mut io)?;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── CLI helpers ──
 
 fn parse_cidr(s: &str) -> Result<(String, u8), Box<dyn std::error::Error>> {
     let (addr, prefix) = s.split_once('/').ok_or_else(|| {
@@ -171,9 +277,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if let Some(cidr) = &addr {
-                let (ip, prefix_len) = parse_cidr(cidr)?;
-                feth.set_inet(&ip, prefix_len)?;
-                println!("set {name} addr {ip}/{prefix_len}");
+                if cidr == "none" {
+                    feth.remove_inet()?;
+                    println!("removed addr from {name}");
+                } else {
+                    let (ip, prefix_len) = parse_cidr(cidr)?;
+                    feth.set_inet(&ip, prefix_len)?;
+                    println!("set {name} addr {ip}/{prefix_len}");
+                }
             }
 
             if let Some(mtu) = mtu {
@@ -198,6 +309,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let feth = Feth::from_existing(&name)?;
             let s = feth.status()?;
             print_status(&s);
+        }
+        Cmd::Capture { name } => {
+            let mut io = FethIO::open(&name)?;
+            let mut buf = vec![0u8; 65536];
+            let mut seq = 0u64;
+            println!("capturing on {name} ...");
+            loop {
+                let n = io.recv(&mut buf)?;
+                seq += 1;
+                print_frame(seq, &buf[..n]);
+            }
+        }
+        Cmd::Icmp { name, addr } => {
+            run_icmp_responder(&name, &addr)?;
         }
     }
 
