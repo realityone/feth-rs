@@ -1,5 +1,62 @@
 use std::{fmt, io, mem, net::Ipv4Addr, str::FromStr};
 
+/// A 6-byte IEEE 802 MAC address.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MacAddr(pub [u8; 6]);
+
+impl MacAddr {
+    /// Generate a random locally-administered unicast MAC address.
+    ///
+    /// The first octet has bit 1 set (locally administered) and bit 0 clear
+    /// (unicast).
+    pub fn random() -> Self {
+        let mut bytes = [0u8; 6];
+        use std::io::Read;
+        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut bytes);
+        }
+        // Set locally administered bit, clear multicast bit
+        bytes[0] = (bytes[0] | 0x02) & 0xFE;
+        Self(bytes)
+    }
+}
+
+impl fmt::Debug for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MacAddr({})", self)
+    }
+}
+
+impl fmt::Display for MacAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b, c, d, e, g] = self.0;
+        write!(f, "{a:02x}:{b:02x}:{c:02x}:{d:02x}:{e:02x}:{g:02x}")
+    }
+}
+
+impl FromStr for MacAddr {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        let parts: Vec<&str> = s.split(':').collect();
+        if parts.len() != 6 {
+            return Err(format!("invalid MAC address: {s}"));
+        }
+        let mut bytes = [0u8; 6];
+        for (i, part) in parts.iter().enumerate() {
+            bytes[i] =
+                u8::from_str_radix(part, 16).map_err(|_| format!("invalid MAC address: {s}"))?;
+        }
+        Ok(MacAddr(bytes))
+    }
+}
+
+impl From<[u8; 6]> for MacAddr {
+    fn from(bytes: [u8; 6]) -> Self {
+        Self(bytes)
+    }
+}
+
 use crate::xnu;
 
 // ── Error type ──
@@ -332,6 +389,27 @@ impl Feth {
         })
     }
 
+    /// Set the MAC (link-layer) address for this interface.
+    ///
+    /// Issues `SIOCSIFLLADDR`.
+    pub fn set_mac(&self, mac: &MacAddr) -> Result<()> {
+        xnu::with_socket(|fd| {
+            let mut ifr = xnu::make_ifreq(&self.name);
+            // Fill ifr_addr as a sockaddr with AF_LINK and the 6 MAC bytes.
+            unsafe {
+                let sa = &mut ifr.ifr_ifru.ifru_addr;
+                sa.sa_len = 6;
+                sa.sa_family = libc::AF_LINK as u8;
+                for (i, &b) in mac.0.iter().enumerate() {
+                    sa.sa_data[i] = b as libc::c_char;
+                }
+            }
+            unsafe { xnu::ioctl::siocsiflladdr(fd, &ifr) }
+                .map_err(ioctl_err("SIOCSIFLLADDR"))?;
+            Ok(())
+        })
+    }
+
     /// Configure the interface in one shot: set peer, assign address, bring up.
     pub fn configure(&self, peer_name: &str, addr: &str, prefix_len: u8) -> Result<()> {
         self.set_peer(peer_name)?;
@@ -412,6 +490,8 @@ pub struct FethPairSide<'a> {
     pub mtu: Option<u32>,
     /// Whether to bring the interface up (default: not changed).
     pub up: Option<bool>,
+    /// MAC address. If `None`, a random locally-administered address is used.
+    pub mac: Option<MacAddr>,
 }
 
 /// Create a linked pair of feth interfaces.
@@ -439,6 +519,8 @@ pub fn create_pair(unit_a: u32, side_a: FethPairSide<'_>, unit_b: u32, side_b: F
     a.set_peer(b.name()).map_err(&cleanup)?;
 
     for (feth, side) in [(&a, &side_a), (&b, &side_b)] {
+        let mac = side.mac.unwrap_or_else(MacAddr::random);
+        feth.set_mac(&mac).map_err(&cleanup)?;
         if let Some(addr) = side.addr {
             let prefix_len = side.prefix_len.unwrap_or(24);
             feth.set_inet(addr, prefix_len).map_err(&cleanup)?;

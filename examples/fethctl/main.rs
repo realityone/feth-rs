@@ -11,7 +11,7 @@ use std::{net::Ipv4Addr, process::ExitCode, str::FromStr};
 use clap::{Parser, Subcommand, ValueEnum};
 use feth_rs::{
     feth_tokio::AsyncFethIO,
-    feth::{Feth, FethStatus},
+    feth::{Feth, FethStatus, MacAddr as FethMacAddr},
     feth_io::FethIO,
 };
 use packet::{
@@ -65,6 +65,10 @@ enum Cmd {
         /// Set MTU.
         #[arg(long)]
         mtu: Option<u32>,
+
+        /// Set MAC address (e.g. 02:fe:0a:00:00:01). Use "random" to generate one.
+        #[arg(long)]
+        mac: Option<String>,
 
         /// Bring interface up or down.
         #[arg(long)]
@@ -274,9 +278,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             peer,
             addr,
             mtu,
+            mac,
             state,
         } => {
             let feth = Feth::from_existing(&name)?;
+
+            if let Some(mac_str) = &mac {
+                let mac_addr = if mac_str == "random" {
+                    FethMacAddr::random()
+                } else {
+                    mac_str.parse::<FethMacAddr>().map_err(|e| e)?
+                };
+                feth.set_mac(&mac_addr)?;
+                println!("set {name} mac {mac_addr}");
+            }
 
             if let Some(peer) = &peer {
                 if peer == "none" {

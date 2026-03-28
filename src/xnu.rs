@@ -99,6 +99,8 @@ pub mod ioctl {
     nix::ioctl_readwrite!(siocgifaddr, b'i', 33, libc::ifreq);
     // SIOCGIFNETMASK: _IOWR('i', 37, struct ifreq)
     nix::ioctl_readwrite!(siocgifnetmask, b'i', 37, libc::ifreq);
+    // SIOCSIFLLADDR: _IOW('i', 60, struct ifreq)
+    nix::ioctl_write_ptr!(siocsiflladdr, b'i', 60, libc::ifreq);
 }
 
 // ── Low-level helpers ──
