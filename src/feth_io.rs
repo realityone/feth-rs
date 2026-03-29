@@ -190,10 +190,9 @@ impl FethIO {
         &self.name
     }
 
-    /// Set non-blocking mode on both the BPF and NDRV file descriptors.
+    /// Set non-blocking mode on the BPF file descriptor.
     pub fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         set_nonblocking(&self.bpf, nonblocking)?;
-        set_nonblocking(&self.ndrv, nonblocking)?;
         Ok(())
     }
 
