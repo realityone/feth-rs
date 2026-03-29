@@ -141,6 +141,15 @@ impl AsyncFethIO {
         }
     }
 
+    /// Try to extract the next buffered frame without any I/O.
+    ///
+    /// Returns `Ok(Some(n))` if a frame was available in the BPF buffer,
+    /// `Ok(None)` if the buffer is exhausted. Use this to drain all
+    /// buffered frames after an initial `recv()`.
+    pub fn try_next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        self.next_frame(buf)
+    }
+
     /// Parse the next `bpf_hdr` + payload from the internal buffer.
     /// Returns `None` when the buffer is exhausted.
     fn next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
