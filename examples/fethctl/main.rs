@@ -59,8 +59,9 @@ enum Cmd {
         peer: Option<String>,
 
         /// Set IPv4 address in CIDR notation (e.g. 10.0.0.1/24).
+        /// Replaces existing address. Repeat for multiple (--addr X --addr Y).
         #[arg(long)]
-        addr: Option<String>,
+        addr: Vec<String>,
 
         /// Set MTU.
         #[arg(long)]
@@ -303,11 +304,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            if let Some(cidr) = &addr {
-                if cidr == "none" {
-                    feth.remove_inet()?;
-                    println!("removed addr from {name}");
-                } else {
+            if !addr.is_empty() {
+                // Remove existing address first to replace, not accumulate.
+                let _ = feth.remove_inet();
+                for cidr in &addr {
                     let (ip, prefix_len) = parse_cidr(cidr)?;
                     feth.set_inet(&ip, prefix_len)?;
                     println!("set {name} addr {ip}/{prefix_len}");
