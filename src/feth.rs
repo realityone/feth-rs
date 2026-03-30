@@ -410,6 +410,50 @@ impl Feth {
         })
     }
 
+    /// Configure IPv6 NDP parameters on this interface.
+    ///
+    /// Mirrors ZeroTier's `configureIpv6Parameters()`:
+    /// - `perform_nud`: enable/disable Neighbor Unreachability Detection
+    ///   (`ND6_IFF_PERFORMNUD`).
+    /// - `accept_router_adverts`: enable/disable acceptance of Router
+    ///   Advertisements (`SIOCAUTOCONF_START` / `SIOCAUTOCONF_STOP`).
+    pub fn configure_ipv6(&self, perform_nud: bool, accept_router_adverts: bool) -> Result<()> {
+        xnu::with_socket6(|fd| {
+            // Read current ND info.
+            let mut nd: xnu::in6_ndireq = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut nd.ifname, &self.name);
+
+            unsafe { xnu::ioctl::siocgifinfo_in6(fd, &mut nd) }
+                .map_err(ioctl_err("SIOCGIFINFO_IN6"))?;
+
+            let old_flags = nd.ndi.flags;
+            if perform_nud {
+                nd.ndi.flags |= xnu::ND6_IFF_PERFORMNUD;
+            } else {
+                nd.ndi.flags &= !xnu::ND6_IFF_PERFORMNUD;
+            }
+
+            if old_flags != nd.ndi.flags {
+                unsafe { xnu::ioctl::siocsifinfo_flags(fd, &mut nd) }
+                    .map_err(ioctl_err("SIOCSIFINFO_FLAGS"))?;
+            }
+
+            // Configure router advertisement acceptance.
+            let mut ifr6: xnu::in6_ifreq = unsafe { mem::zeroed() };
+            xnu::copy_name(&mut ifr6.ifr_name, &self.name);
+
+            if accept_router_adverts {
+                unsafe { xnu::ioctl::siocautoconf_start(fd, &mut ifr6) }
+                    .map_err(ioctl_err("SIOCAUTOCONF_START"))?;
+            } else {
+                unsafe { xnu::ioctl::siocautoconf_stop(fd, &mut ifr6) }
+                    .map_err(ioctl_err("SIOCAUTOCONF_STOP"))?;
+            }
+
+            Ok(())
+        })
+    }
+
     /// Configure the interface in one shot: set peer, assign address, bring up.
     pub fn configure(&self, peer_name: &str, addr: &str, prefix_len: u8) -> Result<()> {
         self.set_peer(peer_name)?;

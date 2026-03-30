@@ -20,6 +20,10 @@ pub const IFF_UP: libc::c_short = 0x1;
 pub const IF_FAKE_S_CMD_SET_PEER: libc::c_ulong = 1;
 pub const IF_FAKE_G_CMD_GET_PEER: libc::c_ulong = 1;
 
+// ── Constants (netinet6/nd6.h) ──
+
+pub const ND6_IFF_PERFORMNUD: u32 = 0x1;
+
 // ── FFI struct definitions (only those not provided by libc) ──
 
 /// `struct ifdrv` (bsd/net/if.h) — 40 bytes on 64-bit macOS.
@@ -57,12 +61,56 @@ pub struct in_aliasreq {
     pub ifra_mask: libc::sockaddr_in,
 }
 
+/// `struct nd_ifinfo` (`netinet6/nd6.h`) — 56 bytes.
+///
+/// NDP per-interface configuration. The `flags` field at offset 20 is the
+/// primary field of interest (`ND6_IFF_PERFORMNUD`, etc.).
+#[repr(C)]
+pub struct nd_ifinfo {
+    pub linkmtu: u32,
+    pub maxmtu: u32,
+    pub basereachable: u32,
+    pub reachable: u32,
+    pub retrans: u32,
+    pub flags: u32,
+    pub recalctm: i32,
+    pub chlim: u8,
+    pub receivedra: u8,
+    pub randomseed0: [u8; 8],
+    pub randomseed1: [u8; 8],
+    pub randomid: [u8; 8],
+}
+
+/// `struct in6_ndireq` (`netinet6/nd6.h`) — 72 bytes.
+///
+/// Used by `SIOCSIFINFO_FLAGS`. Also used as the buffer for
+/// `SIOCGIFINFO_IN6` (which technically expects `in6_ondireq` — 48 bytes)
+/// since the first 48 bytes have the same layout.
+#[repr(C)]
+pub struct in6_ndireq {
+    pub ifname: [libc::c_char; libc::IFNAMSIZ],
+    pub ndi: nd_ifinfo,
+}
+
+/// `struct in6_ifreq` (`netinet6/in6_var.h`) — 288 bytes.
+///
+/// Used by `SIOCAUTOCONF_STOP`. We only need the `ifr_name` field;
+/// the union body is represented as opaque padding.
+#[repr(C)]
+pub struct in6_ifreq {
+    pub ifr_name: [libc::c_char; libc::IFNAMSIZ],
+    pub _union: [u8; 272], // sizeof(union) = sizeof(icmp6_ifstat) = 272
+}
+
 // Compile-time layout assertions matching the C ABI.
 const _: () = assert!(size_of::<libc::ifreq>() == 32);
 const _: () = assert!(size_of::<ifdrv>() == 40);
 const _: () = assert!(size_of::<if_fake_request>() == 160);
 const _: () = assert!(size_of::<libc::sockaddr_in>() == 16);
 const _: () = assert!(size_of::<in_aliasreq>() == 64);
+const _: () = assert!(size_of::<nd_ifinfo>() == 56);
+const _: () = assert!(size_of::<in6_ndireq>() == 72);
+const _: () = assert!(size_of::<in6_ifreq>() == 288);
 
 // ── ioctl definitions via nix macros (bsd/sys/sockio.h) ──
 //
@@ -73,7 +121,7 @@ const _: () = assert!(size_of::<in_aliasreq>() == 64);
 // _IOW  (write)      → ioctl_write_ptr!  → fn(fd, *const T)
 
 pub mod ioctl {
-    use super::{ifdrv, in_aliasreq};
+    use super::{ifdrv, in6_ifreq, in6_ndireq, in_aliasreq};
 
     // SIOCIFCREATE2: _IOWR('i', 122, struct ifreq)
     nix::ioctl_readwrite!(siocifcreate2, b'i', 122, libc::ifreq);
@@ -101,6 +149,20 @@ pub mod ioctl {
     nix::ioctl_readwrite!(siocgifnetmask, b'i', 37, libc::ifreq);
     // SIOCSIFLLADDR: _IOW('i', 60, struct ifreq)
     nix::ioctl_write_ptr!(siocsiflladdr, b'i', 60, libc::ifreq);
+
+    // ── IPv6 NDP ioctls (netinet6/nd6.h, netinet6/in6_var.h) ──
+
+    // SIOCGIFINFO_IN6: _IOWR('i', 76, struct in6_ondireq) — 48 bytes
+    //
+    // Hardcoded because the ioctl encodes `in6_ondireq` (48 bytes) but we
+    // pass `in6_ndireq` (72 bytes) since the first 48 bytes share the same layout.
+    nix::ioctl_readwrite_bad!(siocgifinfo_in6, 0xC030694C, in6_ndireq);
+    // SIOCSIFINFO_FLAGS: _IOWR('i', 87, struct in6_ndireq) — 72 bytes
+    nix::ioctl_readwrite!(siocsifinfo_flags, b'i', 87, in6_ndireq);
+    // SIOCAUTOCONF_START: _IOWR('i', 132, struct in6_ifreq) — 288 bytes
+    nix::ioctl_readwrite!(siocautoconf_start, b'i', 132, in6_ifreq);
+    // SIOCAUTOCONF_STOP: _IOWR('i', 133, struct in6_ifreq) — 288 bytes
+    nix::ioctl_readwrite!(siocautoconf_stop, b'i', 133, in6_ifreq);
 }
 
 // ── Low-level helpers ──
@@ -160,6 +222,23 @@ where
     E: From<io::Error>,
 {
     let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(E::from(io::Error::last_os_error()));
+    }
+    let result = f(fd);
+    unsafe {
+        libc::close(fd);
+    }
+    result
+}
+
+/// Execute a closure with a temporary `AF_INET6/SOCK_DGRAM` socket.
+pub fn with_socket6<F, T, E>(f: F) -> Result<T, E>
+where
+    F: FnOnce(libc::c_int) -> Result<T, E>,
+    E: From<io::Error>,
+{
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
     if fd < 0 {
         return Err(E::from(io::Error::last_os_error()));
     }
