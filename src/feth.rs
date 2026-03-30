@@ -67,6 +67,10 @@ pub enum Error {
         operation: &'static str,
         source: io::Error,
     },
+    Ifconfig {
+        args: Vec<String>,
+        source: io::Error,
+    },
     InvalidName(String),
     InvalidAddress {
         input: String,
@@ -81,6 +85,9 @@ impl fmt::Display for Error {
         match self {
             Error::Ioctl { operation, source } => {
                 write!(f, "ioctl {operation} failed: {source}")
+            }
+            Error::Ifconfig { args, source } => {
+                write!(f, "ifconfig {} failed: {source}", args.join(" "))
             }
             Error::InvalidName(name) => write!(f, "invalid interface name: {name}"),
             Error::InvalidAddress { input, source } => {
@@ -97,7 +104,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Error::Ioctl { source, .. } | Error::Socket(source) => Some(source),
+            Error::Ioctl { source, .. } | Error::Ifconfig { source, .. } | Error::Socket(source) => Some(source),
             Error::InvalidAddress { source, .. } => Some(source),
             _ => None,
         }
@@ -121,14 +128,14 @@ fn ioctl_err(op: &'static str) -> impl FnOnce(nix::errno::Errno) -> Error {
     }
 }
 
-fn validate_name(name: &str) -> Result<()> {
+pub fn validate_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() >= libc::IFNAMSIZ {
         return Err(Error::InvalidName(name.to_string()));
     }
     Ok(())
 }
 
-fn validate_prefix_len(prefix_len: u8) -> Result<()> {
+pub fn validate_prefix_len(prefix_len: u8) -> Result<()> {
     if prefix_len > 32 {
         return Err(Error::InvalidPrefixLen(prefix_len));
     }
@@ -142,7 +149,7 @@ fn parse_addr(addr: &str) -> Result<Ipv4Addr> {
     })
 }
 
-fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
+pub fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
     if prefix_len == 0 {
         Ipv4Addr::UNSPECIFIED
     } else {
@@ -150,7 +157,7 @@ fn prefix_to_mask(prefix_len: u8) -> Ipv4Addr {
     }
 }
 
-fn broadcast_addr(addr: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
+pub fn broadcast_addr(addr: Ipv4Addr, mask: Ipv4Addr) -> Ipv4Addr {
     Ipv4Addr::from(u32::from(addr) | !u32::from(mask))
 }
 
@@ -404,8 +411,7 @@ impl Feth {
                     sa.sa_data[i] = b as libc::c_char;
                 }
             }
-            unsafe { xnu::ioctl::siocsiflladdr(fd, &ifr) }
-                .map_err(ioctl_err("SIOCSIFLLADDR"))?;
+            unsafe { xnu::ioctl::siocsiflladdr(fd, &ifr) }.map_err(ioctl_err("SIOCSIFLLADDR"))?;
             Ok(())
         })
     }
@@ -543,7 +549,12 @@ pub struct FethPairSide<'a> {
 /// Creates both interfaces and peers them bidirectionally. Address
 /// assignment, MTU, and link state are applied per-side when specified.
 /// On any failure the interfaces are destroyed before returning.
-pub fn create_pair(unit_a: u32, side_a: FethPairSide<'_>, unit_b: u32, side_b: FethPairSide<'_>) -> Result<(Feth, Feth)> {
+pub fn create_pair(
+    unit_a: u32,
+    side_a: FethPairSide<'_>,
+    unit_b: u32,
+    side_b: FethPairSide<'_>,
+) -> Result<(Feth, Feth)> {
     let a = Feth::create(unit_a)?;
     let b = match Feth::create(unit_b) {
         Ok(b) => b,
