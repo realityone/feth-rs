@@ -249,6 +249,26 @@ where
     result
 }
 
+/// Set `net.link.fake.max_mtu` via `sysctlbyname(3)` to enable jumbo frames
+/// on feth interfaces.
+pub fn set_fake_max_mtu(mtu: u32) -> io::Result<()> {
+    let name = c"net.link.fake.max_mtu";
+    let mut val: libc::c_int = mtu as libc::c_int;
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut val as *mut libc::c_int as *mut libc::c_void,
+            mem::size_of::<libc::c_int>(),
+        )
+    };
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
