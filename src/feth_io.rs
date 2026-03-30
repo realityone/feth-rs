@@ -62,47 +62,51 @@ fn open_bpf() -> io::Result<OwnedFd> {
 }
 
 /// Configure a BPF fd for raw frame capture on the given interface.
-fn configure_bpf(bpf: &OwnedFd, ifname: &str) -> io::Result<()> {
-    unsafe {
-        let fd = bpf.as_raw_fd();
+///
+/// Returns the actual buffer size negotiated with the kernel (may differ
+/// from `BPF_BUFFER_LEN`).
+fn configure_bpf(bpf: &OwnedFd, ifname: &str) -> io::Result<usize> {
+    let fd = bpf.as_raw_fd();
 
-        // Set buffer length.
-        let mut buf_len: libc::c_int = BPF_BUFFER_LEN as libc::c_int;
-        if libc::ioctl(fd, libc::BIOCSBLEN, &mut buf_len) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Return packets immediately (don't wait for buffer to fill).
-        let mut enable: libc::c_int = 1;
-        if libc::ioctl(fd, libc::BIOCIMMEDIATE, &mut enable) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Don't see our own sent packets.
-        let mut disable: libc::c_int = 0;
-        if libc::ioctl(fd, libc::BIOCSSEESENT, &mut disable) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Bind to the interface.
-        let mut ifr = xnu::make_ifreq(ifname);
-        if libc::ioctl(fd, libc::BIOCSETIF, &mut ifr) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // We supply complete ethernet headers ourselves.
-        let mut enable: libc::c_int = 1;
-        if libc::ioctl(fd, libc::BIOCSHDRCMPLT, &mut enable) != 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        // Promiscuous mode — capture all frames.
-        let mut enable: libc::c_int = 1;
-        if libc::ioctl(fd, libc::c_ulong::from(libc::BIOCPROMISC), &mut enable) != 0 {
-            return Err(io::Error::last_os_error());
-        }
+    // Set buffer length.  The kernel may adjust the value; use the
+    // returned size for subsequent reads (matching BPF semantics).
+    let mut buf_len: libc::c_int = BPF_BUFFER_LEN as libc::c_int;
+    if unsafe { libc::ioctl(fd, libc::BIOCSBLEN, &mut buf_len) } != 0 {
+        return Err(io::Error::last_os_error());
     }
-    Ok(())
+    let actual_buf_len = buf_len as usize;
+
+    // Return packets immediately (don't wait for buffer to fill).
+    let mut enable: libc::c_int = 1;
+    if unsafe { libc::ioctl(fd, libc::BIOCIMMEDIATE, &mut enable) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Don't see our own sent packets.
+    let mut disable: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::BIOCSSEESENT, &mut disable) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Bind to the interface.
+    let mut ifr = xnu::make_ifreq(ifname);
+    if unsafe { libc::ioctl(fd, libc::BIOCSETIF, &mut ifr) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // We supply complete ethernet headers ourselves.
+    let mut enable: libc::c_int = 1;
+    if unsafe { libc::ioctl(fd, libc::BIOCSHDRCMPLT, &mut enable) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    // Promiscuous mode — capture all frames.
+    let mut enable: libc::c_int = 1;
+    if unsafe { libc::ioctl(fd, libc::c_ulong::from(libc::BIOCPROMISC), &mut enable) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(actual_buf_len)
 }
 
 // ── NDRV helpers ──
@@ -172,14 +176,14 @@ impl FethIO {
     /// feth pair (the peer that has no IP configuration).
     pub fn open(ifname: &str) -> io::Result<Self> {
         let bpf = open_bpf()?;
-        configure_bpf(&bpf, ifname)?;
+        let buf_len = configure_bpf(&bpf, ifname)?;
         let ndrv = open_ndrv(ifname)?;
 
         Ok(Self {
             name: ifname.to_string(),
             bpf,
             ndrv,
-            read_buf: vec![0u8; BPF_BUFFER_LEN],
+            read_buf: vec![0u8; buf_len],
             read_len: 0,
             read_pos: 0,
         })
@@ -206,9 +210,10 @@ impl FethIO {
         self.ndrv.as_raw_fd()
     }
 
-    /// Decompose into the raw parts: `(name, bpf_fd, ndrv_fd)`.
-    pub fn into_parts(self) -> (String, OwnedFd, OwnedFd) {
-        (self.name, self.bpf, self.ndrv)
+    /// Decompose into the raw parts: `(name, bpf_fd, ndrv_fd, buf_len)`.
+    pub fn into_parts(self) -> (String, OwnedFd, OwnedFd, usize) {
+        let buf_len = self.read_buf.len();
+        (self.name, self.bpf, self.ndrv, buf_len)
     }
 
     /// Send a raw ethernet frame.
@@ -272,35 +277,39 @@ impl FethIO {
     /// Parse the next `bpf_hdr` + payload from the internal buffer.
     /// Returns `None` when the buffer is exhausted.
     fn next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        if self.read_pos >= self.read_len {
-            return Ok(None);
-        }
+        while self.read_pos + size_of::<libc::bpf_hdr>() <= self.read_len {
+            unsafe {
+                let ptr = self.read_buf.as_ptr().add(self.read_pos);
+                let hdr = &*(ptr as *const libc::bpf_hdr);
+                let hdr_len = hdr.bh_hdrlen as usize;
+                let cap_len = hdr.bh_caplen as usize;
 
-        unsafe {
-            let ptr = self.read_buf.as_ptr().add(self.read_pos);
-            let hdr = &*(ptr as *const libc::bpf_hdr);
-            let hdr_len = hdr.bh_hdrlen as usize;
-            let cap_len = hdr.bh_caplen as usize;
+                // Advance to the next BPF-aligned record.
+                // BPF_WORDALIGN: round up to next 4-byte boundary.
+                let total = (hdr_len + cap_len + 3) & !3;
+                self.read_pos += total;
 
-            // Advance to the next BPF-aligned record.
-            // BPF_WORDALIGN: round up to next 4-byte boundary.
-            let total = (hdr_len + cap_len + 3) & !3;
-            self.read_pos += total;
+                // Skip zero-length records (padding) and records that
+                // extend past the valid data — matches ZeroTier behaviour.
+                if cap_len == 0
+                    || self.read_pos.wrapping_sub(total) + hdr_len + cap_len > self.read_len
+                {
+                    continue;
+                }
 
-            if cap_len == 0 {
-                return Ok(None);
+                let payload_start = ptr.add(hdr_len);
+                if buf.len() < cap_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
+                    ));
+                }
+                std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
+                return Ok(Some(cap_len));
             }
-
-            let payload_start = ptr.add(hdr_len);
-            if buf.len() < cap_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
-                ));
-            }
-            std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
-            Ok(Some(cap_len))
         }
+        self.read_pos = self.read_len;
+        Ok(None)
     }
 }
 

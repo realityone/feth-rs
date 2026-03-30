@@ -18,8 +18,6 @@ use tokio::io::{unix::AsyncFd, Interest};
 
 use crate::feth_io::FethIO;
 
-const BPF_BUFFER_LEN: usize = 131_072;
-
 /// Async raw I/O handle for a feth interface.
 ///
 /// Created from a [`FethIO`] via [`AsyncFethIO::new`].
@@ -41,7 +39,7 @@ impl AsyncFethIO {
     /// tokio's reactor.
     pub fn new(sync_io: FethIO) -> io::Result<Self> {
         sync_io.set_nonblocking(true)?;
-        let (name, bpf_fd, ndrv_fd) = sync_io.into_parts();
+        let (name, bpf_fd, ndrv_fd, buf_len) = sync_io.into_parts();
 
         let bpf = AsyncFd::with_interest(bpf_fd, Interest::READABLE)?;
 
@@ -49,7 +47,7 @@ impl AsyncFethIO {
             name,
             bpf,
             ndrv: ndrv_fd,
-            read_buf: vec![0u8; BPF_BUFFER_LEN],
+            read_buf: vec![0u8; buf_len],
             read_len: 0,
             read_pos: 0,
         })
@@ -153,33 +151,37 @@ impl AsyncFethIO {
     /// Parse the next `bpf_hdr` + payload from the internal buffer.
     /// Returns `None` when the buffer is exhausted.
     fn next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        if self.read_pos >= self.read_len {
-            return Ok(None);
-        }
+        while self.read_pos + size_of::<libc::bpf_hdr>() <= self.read_len {
+            unsafe {
+                let ptr = self.read_buf.as_ptr().add(self.read_pos);
+                let hdr = &*(ptr as *const libc::bpf_hdr);
+                let hdr_len = hdr.bh_hdrlen as usize;
+                let cap_len = hdr.bh_caplen as usize;
 
-        unsafe {
-            let ptr = self.read_buf.as_ptr().add(self.read_pos);
-            let hdr = &*(ptr as *const libc::bpf_hdr);
-            let hdr_len = hdr.bh_hdrlen as usize;
-            let cap_len = hdr.bh_caplen as usize;
+                // BPF_WORDALIGN: round up to next 4-byte boundary.
+                let total = (hdr_len + cap_len + 3) & !3;
+                self.read_pos += total;
 
-            // BPF_WORDALIGN: round up to next 4-byte boundary.
-            let total = (hdr_len + cap_len + 3) & !3;
-            self.read_pos += total;
+                // Skip zero-length records (padding) and records that
+                // extend past the valid data — matches ZeroTier behaviour.
+                if cap_len == 0
+                    || self.read_pos.wrapping_sub(total) + hdr_len + cap_len > self.read_len
+                {
+                    continue;
+                }
 
-            if cap_len == 0 {
-                return Ok(None);
+                let payload_start = ptr.add(hdr_len);
+                if buf.len() < cap_len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
+                    ));
+                }
+                std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
+                return Ok(Some(cap_len));
             }
-
-            let payload_start = ptr.add(hdr_len);
-            if buf.len() < cap_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
-                ));
-            }
-            std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
-            Ok(Some(cap_len))
         }
+        self.read_pos = self.read_len;
+        Ok(None)
     }
 }
