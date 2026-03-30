@@ -1,7 +1,7 @@
 //! Builder-pattern API for creating and configuring feth interfaces.
 //!
 //! The builder supports two backends — [`Backend::Ioctl`] (direct system calls,
-//! the default) and [`Backend::Ifconfig`] (shells out to `/usr/sbin/ifconfig`).
+//! the default) and [`Backend::Ifconfig`] (shells out to `/sbin/ifconfig`).
 //!
 //! # Examples
 //!
@@ -43,7 +43,7 @@ pub enum Backend {
     /// Direct ioctl system calls (default).
     #[default]
     Ioctl,
-    /// Shell out to `/usr/sbin/ifconfig`.
+    /// Shell out to `/sbin/ifconfig`.
     Ifconfig,
 }
 

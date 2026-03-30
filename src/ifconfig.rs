@@ -1,7 +1,7 @@
 //! Ifconfig-based backend for feth interface management.
 //!
 //! This module provides an alternative to the ioctl-based approach in [`crate::feth`],
-//! executing `/usr/sbin/ifconfig` commands to manage feth interfaces. This can be
+//! executing `/sbin/ifconfig` commands to manage feth interfaces. This can be
 //! useful when ioctl calls fail (e.g. IPv6 NDP on interfaces not yet fully up) or
 //! when running in environments where direct ioctl access is restricted.
 
@@ -11,7 +11,7 @@ use crate::feth::{self, Error, FethStatus, MacAddr, Result};
 
 /// Execute an ifconfig command with the given arguments.
 fn ifconfig(args: &[&str]) -> Result<String> {
-    let output = Command::new("/usr/sbin/ifconfig")
+    let output = Command::new("/sbin/ifconfig")
         .args(args)
         .output()
         .map_err(|e| Error::Ifconfig {
@@ -33,7 +33,7 @@ fn ifconfig(args: &[&str]) -> Result<String> {
 /// A handle representing a feth interface managed via ifconfig commands.
 ///
 /// This is functionally equivalent to [`crate::feth::Feth`] but uses
-/// `/usr/sbin/ifconfig` instead of direct ioctl calls.
+/// `/sbin/ifconfig` instead of direct ioctl calls.
 #[derive(Debug, Clone)]
 pub struct IfconfigFeth {
     name: String,
