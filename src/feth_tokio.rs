@@ -12,6 +12,7 @@
 use std::{
     io::{self, IoSlice},
     os::fd::{AsRawFd, OwnedFd, RawFd},
+    sync::Arc,
 };
 
 use tokio::io::{unix::AsyncFd, Interest};
@@ -24,12 +25,35 @@ use crate::feth_io::FethIO;
 /// The BPF fd is set to non-blocking mode and registered with
 /// tokio's reactor. The NDRV fd performs synchronous writes.
 pub struct AsyncFethIO {
-    name: String,
+    name: Arc<str>,
     bpf: AsyncFd<OwnedFd>,
     ndrv: OwnedFd,
     read_buf: Vec<u8>,
     read_len: usize,
     read_pos: usize,
+}
+
+/// Owned read half of an [`AsyncFethIO`], obtained via [`AsyncFethIO::into_split`].
+///
+/// Reads ethernet frames from the BPF device. The internal buffer may
+/// contain multiple frames per kernel read; use [`recv`](BpfReader::recv)
+/// to get one frame at a time.
+pub struct BpfReader {
+    name: Arc<str>,
+    bpf: AsyncFd<OwnedFd>,
+    read_buf: Vec<u8>,
+    read_len: usize,
+    read_pos: usize,
+}
+
+/// Owned write half of an [`AsyncFethIO`], obtained via [`AsyncFethIO::into_split`].
+///
+/// Sends raw ethernet frames via the `AF_NDRV` socket. Writes are
+/// synchronous because they are effectively instantaneous kernel
+/// buffer copies.
+pub struct NdrvWriter {
+    name: Arc<str>,
+    ndrv: OwnedFd,
 }
 
 impl AsyncFethIO {
@@ -44,7 +68,7 @@ impl AsyncFethIO {
         let bpf = AsyncFd::with_interest(bpf_fd, Interest::READABLE)?;
 
         Ok(Self {
-            name,
+            name: Arc::from(name),
             bpf,
             ndrv: ndrv_fd,
             read_buf: vec![0u8; buf_len],
@@ -74,36 +98,41 @@ impl AsyncFethIO {
         self.ndrv.as_raw_fd()
     }
 
-    /// Send a raw ethernet frame.
-    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
-        let n = unsafe { libc::write(self.ndrv.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
+    /// Split into an owned read half and write half.
+    ///
+    /// The [`BpfReader`] receives frames from the BPF device and the
+    /// [`NdrvWriter`] sends frames via the `AF_NDRV` socket. Both
+    /// halves can be used independently without synchronisation.
+    pub fn into_split(self) -> (BpfReader, NdrvWriter) {
+        let reader = BpfReader {
+            name: Arc::clone(&self.name),
+            bpf: self.bpf,
+            read_buf: self.read_buf,
+            read_len: self.read_len,
+            read_pos: self.read_pos,
+        };
+        let writer = NdrvWriter {
+            name: self.name,
+            ndrv: self.ndrv,
+        };
+        (reader, writer)
+    }
+}
+
+// ── BpfReader ──────────────────────────────────────────────────────
+
+impl BpfReader {
+    /// The interface name this reader is bound to.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
-    /// Send a raw ethernet frame from multiple buffers (vectored write).
-    pub fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
-        let n = unsafe {
-            libc::writev(
-                self.ndrv.as_raw_fd(),
-                bufs.as_ptr().cast(),
-                bufs.len() as libc::c_int,
-            )
-        };
-        if n < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(n as usize)
-        }
+    /// The BPF file descriptor.
+    pub fn bpf_fd(&self) -> RawFd {
+        self.bpf.as_raw_fd()
     }
 
     /// Receive a single ethernet frame.
-    ///
-    /// BPF may return multiple frames per read; this method buffers
-    /// internally and returns one frame at a time.
     pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             if let Some(n) = self.next_frame(buf)? {
@@ -113,7 +142,6 @@ impl AsyncFethIO {
         }
     }
 
-    /// Read from the BPF fd into the internal buffer (async).
     async fn fill_bpf_buffer(&mut self) -> io::Result<()> {
         loop {
             let mut guard = self.bpf.readable().await?;
@@ -140,48 +168,94 @@ impl AsyncFethIO {
     }
 
     /// Try to extract the next buffered frame without any I/O.
-    ///
-    /// Returns `Ok(Some(n))` if a frame was available in the BPF buffer,
-    /// `Ok(None)` if the buffer is exhausted. Use this to drain all
-    /// buffered frames after an initial `recv()`.
     pub fn try_next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
         self.next_frame(buf)
     }
 
-    /// Parse the next `bpf_hdr` + payload from the internal buffer.
-    /// Returns `None` when the buffer is exhausted.
     fn next_frame(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
-        while self.read_pos + size_of::<libc::bpf_hdr>() <= self.read_len {
-            unsafe {
-                let ptr = self.read_buf.as_ptr().add(self.read_pos);
-                let hdr = &*(ptr as *const libc::bpf_hdr);
-                let hdr_len = hdr.bh_hdrlen as usize;
-                let cap_len = hdr.bh_caplen as usize;
-
-                // BPF_WORDALIGN: round up to next 4-byte boundary.
-                let total = (hdr_len + cap_len + 3) & !3;
-                self.read_pos += total;
-
-                // Skip zero-length records (padding) and records that
-                // extend past the valid data — matches ZeroTier behaviour.
-                if cap_len == 0
-                    || self.read_pos.wrapping_sub(total) + hdr_len + cap_len > self.read_len
-                {
-                    continue;
-                }
-
-                let payload_start = ptr.add(hdr_len);
-                if buf.len() < cap_len {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
-                    ));
-                }
-                std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
-                return Ok(Some(cap_len));
-            }
-        }
-        self.read_pos = self.read_len;
-        Ok(None)
+        parse_next_frame(&self.read_buf, &mut self.read_pos, self.read_len, buf)
     }
+}
+
+// ── NdrvWriter ─────────────────────────────────────────────────────
+
+impl NdrvWriter {
+    /// The interface name this writer is bound to.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The NDRV file descriptor.
+    pub fn ndrv_fd(&self) -> RawFd {
+        self.ndrv.as_raw_fd()
+    }
+
+    /// Send a raw ethernet frame.
+    pub fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        let n = unsafe { libc::write(self.ndrv.as_raw_fd(), buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+
+    /// Send a raw ethernet frame from multiple buffers (vectored write).
+    pub fn send_vectored(&self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        let n = unsafe {
+            libc::writev(
+                self.ndrv.as_raw_fd(),
+                bufs.as_ptr().cast(),
+                bufs.len() as libc::c_int,
+            )
+        };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
+// ── Shared helpers ─────────────────────────────────────────────────
+
+/// Parse the next `bpf_hdr` + payload from a BPF read buffer.
+fn parse_next_frame(
+    read_buf: &[u8],
+    read_pos: &mut usize,
+    read_len: usize,
+    buf: &mut [u8],
+) -> io::Result<Option<usize>> {
+    while *read_pos + size_of::<libc::bpf_hdr>() <= read_len {
+        unsafe {
+            let ptr = read_buf.as_ptr().add(*read_pos);
+            let hdr = &*(ptr as *const libc::bpf_hdr);
+            let hdr_len = hdr.bh_hdrlen as usize;
+            let cap_len = hdr.bh_caplen as usize;
+
+            // BPF_WORDALIGN: round up to next 4-byte boundary.
+            let total = (hdr_len + cap_len + 3) & !3;
+            *read_pos += total;
+
+            // Skip zero-length records (padding) and records that
+            // extend past the valid data — matches ZeroTier behaviour.
+            if cap_len == 0
+                || read_pos.wrapping_sub(total) + hdr_len + cap_len > read_len
+            {
+                continue;
+            }
+
+            let payload_start = ptr.add(hdr_len);
+            if buf.len() < cap_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("buffer too small: need {cap_len} bytes, got {}", buf.len()),
+                ));
+            }
+            std::ptr::copy_nonoverlapping(payload_start, buf.as_mut_ptr(), cap_len);
+            return Ok(Some(cap_len));
+        }
+    }
+    *read_pos = read_len;
+    Ok(None)
 }
